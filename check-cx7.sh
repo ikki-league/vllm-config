@@ -17,6 +17,11 @@ ibdev2netdev | grep -F "$IFNAME"
 ping -c 3 -M do -s 8972 "$PEER" >/dev/null && echo "[OK] $PEER joignable en MTU 9000" \
   || { echo "[KO] $PEER injoignable en MTU 9000"; exit 1; }
 
+# UFW actif bloque le rendez-vous vLLM et le bootstrap NCCL (voir README 4.5)
+if grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+  echo "[WARN] UFW actif : vérifier 'sudo ufw status' -> ALLOW IN on $IFNAME from 192.168.100.0/24"
+fi
+
 # Les poids doivent être présents localement sur chaque nœud
 ls -d /home/mak/ai/models/hub/models--Qwen--Qwen3.8-27B-FP8 >/dev/null 2>&1 \
   && echo "[OK] Poids Qwen3.8-27B-FP8 présents" \

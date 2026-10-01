@@ -172,6 +172,23 @@ Résultat attendu sur chaque machine :
 Si le port câblé n'est pas `enp1s0f1np1`, passez-le en 2e argument :
 `./check-cx7.sh 192.168.100.11 enp1s0f0np0`.
 
+### 4.5 Ouvrir le pare-feu sur le lien CX7 🅰️🅱️
+
+Si UFW est actif (politique `DROP` par défaut), le worker ne peut pas joindre
+le rendez-vous du head (`29501`) ni les ports aléatoires qu'ouvrent NCCL et
+vLLM entre les nœuds : le head attend alors 10 minutes puis échoue avec
+`Timed out ... waiting for clients. 1/2 clients joined.` Le lien étant direct
+et privé, on autorise tout le trafic qui arrive par lui :
+
+```bash
+sudo ufw allow in on enp1s0f1np1 from 192.168.100.0/24
+sudo ufw status verbose
+```
+
+(adapter le nom d'interface si le port câblé est `enp1s0f0np0`). Les
+transferts RDMA eux-mêmes ne passent pas par netfilter, mais le rendez-vous
+et le bootstrap NCCL sont en TCP.
+
 ---
 
 ## 5. Mettre les poids du modèle sur les deux machines 🅰️🅱️
@@ -340,11 +357,12 @@ extra_hosts:
 
 | Symptôme | Cause probable | À vérifier |
 |---|---|---|
-| Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.10` depuis B ; pas de pare-feu (`sudo ufw status`) |
+| Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.10` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
 | `NET/Socket` au lieu de `NET/IB` dans les logs | NCCL ne trouve pas les cartes RDMA | `CX7_HCA` correspond au port câblé (`ibdev2netdev`) ; `/dev/infiniband` existe sur l'hôte |
 | Le ping jumbo de `check-cx7.sh` échoue | MTU différent des deux côtés | `ip link show <iface>` → `mtu 9000` sur A et B |
 | Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `docker compose build` refait des deux côtés |
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
+| Réponses vides ou remplies de `!!!!` | bug amont prefix caching + MTP sur modèle hybride (vllm#53912) | retirer `--enable-prefix-caching` du compose sur A et B |
 | Un nœud télécharge le modèle au démarrage | poids absents localement | étape 5 |
 | Coupure ou ralentissement sous charge | thermique | étape 3, `systemctl status vllm-thermal` sur **les deux** machines |
 

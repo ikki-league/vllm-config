@@ -33,8 +33,6 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - NVIDIA_FORWARD_COMPAT=1
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - VLLM_DISABLE_FP4_MOE_PROBE=1
-      - VLLM_FLASHINFER_MOE_BACKEND=latency
       - HF_HOME=/root/.cache/huggingface
       - TORCH_CUDA_ARCH_LIST=12.1a
       - TORCH_MATMUL_PRECISION=high
@@ -64,6 +62,16 @@ services:
         soft: 67108864
         hard: 67108864
 
+    # Notes de tuning (vLLM 0.27.1, GB10 sm_121) :
+    # - le drafter MTP n'hérite pas de --attention-backend : sans
+    #   attention_backend dans --speculative-config il prend FlashInfer, ce qui
+    #   rétrograde tout le moteur en cudagraph PIECEWISE.
+    # - max-cudagraph-capture-size = max-num-seqs x (1 + num_speculative_tokens).
+    # - KV cache bf16 : le gain mémoire du fp8 est faible sur ce modèle hybride
+    #   (état GDN non quantifié) et la mémoire de deux nœuds suffit.
+    # - custom all-reduce inopérant entre deux nœuds, désactivé explicitement.
+    # - prefix caching + MTP sur hybride GDN : bugs connus en amont (sorties
+    #   "!!!!" ou vides, vllm#53912) ; à désactiver si ça apparaît.
     # Tous les arguments sauf VLLM_ROLE_ARGS doivent être identiques sur les
     # deux nœuds : c'est garanti tant que les deux machines sont sur le même
     # commit de ce dépôt.
@@ -77,9 +85,9 @@ services:
       --master-port ${MASTER_PORT:-29501}
       --max-model-len 262144
       --max-num-batched-tokens 32768
-      --gpu-memory-utilization 0.82
+      --gpu-memory-utilization 0.85
       --max-num-seqs 64
-      --kv-cache-dtype fp8_e4m3
+      --kv-cache-dtype auto
       --attention-backend triton_attn
       --enable-chunked-prefill
       --enable-prefix-caching
@@ -88,8 +96,9 @@ services:
       --enable-auto-tool-choice
       --tool-call-parser qwen3_coder
       --chat-template /workspace/unsloth.jinja
-      --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}'
-      --max-cudagraph-capture-size 1024
+      --speculative-config '{"method": "mtp", "num_speculative_tokens": 3, "attention_backend": "TRITON_ATTN"}'
+      --max-cudagraph-capture-size 256
+      --disable-custom-all-reduce
       --trust-remote-code
       ${VLLM_ROLE_ARGS:?VLLM_ROLE_ARGS manquant dans .env}
 
