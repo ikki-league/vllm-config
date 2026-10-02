@@ -6,10 +6,12 @@ Spark** reliés en direct par un câble QSFP. Ce guide explique pas à pas
 comment passer de « deux machines indépendantes » à « un seul serveur
 d'inférence sur deux machines ».
 
-> Configuration reprise de [sudoingX](https://x.com/sudoingX/status/2105246609730924695)
-> (30/09/2026) : vLLM nightly standard, 15 tok/s sans MTP jusqu'à 128K de
-> contexte. Le modèle **ne tient pas sur une seule Spark** : TP=2 est
-> obligatoire. Pour revenir à Qwen3.8 : `git checkout qwen3.8-dual-spark`
+> Recette [tonyd2wild CURRENT.md](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/blob/d061f26ad3ec5c3c04f64aad7516dbe62a8aa6af/CURRENT.md)
+> (@d061f26) : image vLLM patchée sm121, décodage spéculatif DFlash2, 262K de
+> contexte, 6 requêtes simultanées. Mesuré par l'auteur : ~45 tok/s pour une
+> requête seule (19 en prose, 52 en code), ~85 tok/s cumulés à 6 requêtes.
+> Le modèle **ne tient pas sur une seule Spark** : TP=2 est obligatoire. Le
+> drafter DFlash2 est sous licence **CC-BY-NC-ND 4.0** (non commercial). Pour revenir à Qwen3.8 : `git checkout qwen3.8-dual-spark`
 > sur les deux nœuds.
 
 ---
@@ -44,9 +46,58 @@ Quelques notions utiles :
   coordonne et expose l'API ; le **worker** (rank 1) se contente de calculer.
   On n'envoie jamais de requête au worker.
 - **Ce qui est gagné** : la mémoire de deux GB10 au lieu d'une, soit
-  ~242 GiB. Les poids en prennent ~95 GiB par nœud : il reste très peu de
-  place, d'où une seule requête à la fois (`--max-num-seqs 1`), pas de CUDA
-  graphs (`--enforce-eager`) et un KV cache fp8.
+  ~242 GiB. Les poids en prennent ~87 GiB par nœud : il reste peu de place,
+  d'où un KV cache fp8 épinglé à 6 GiB (560K tokens), au plus 6 requêtes
+  simultanées et pas de CUDA graphs (`--enforce-eager`).
+
+### Le modèle et ses réglages, en clair
+
+- **MoE (Mixture of Experts)** : GLM-5.3 Flash a 320 milliards de paramètres,
+  mais pour chaque token il n'en active que 18 milliards (quelques « experts »
+  choisis parmi des centaines). On paie la **mémoire** d'un modèle de 320B,
+  mais la **vitesse** ressemble à celle d'un modèle de 18B : c'est ce qui le
+  rend utilisable sur des Spark, dont la mémoire est grande mais lente
+  (~273 Go/s).
+- **NVFP4** : les poids des experts sont stockés sur 4 bits au lieu de 16, ce
+  qui divise leur taille par ~3,5. Le GB10 (architecture Blackwell) sait
+  calculer directement dans ce format. L'**attention** reste en haute
+  précision dans le checkpoint NVIDIA : c'est pour ça qu'on n'utilise que
+  celui-là (voir étape 5).
+- **Décodage spéculatif (DFlash2)** : générer un token oblige à relire tous
+  les poids actifs en mémoire, ce qui est lent. Un petit modèle annexe, le
+  **drafter** (2,2 Go), *devine* 7 tokens d'avance ; le gros modèle les
+  **vérifie tous en une seule passe** et garde ceux qui sont justes. Le texte
+  produit est identique à celui du modèle seul, mais 2 à 3 fois plus vite
+  quand le drafter devine bien (code, JSON, appels d'outils) et moins sur de
+  la prose libre.
+- **KV cache** : la « mémoire de travail » des conversations en cours. Chaque
+  token déjà lu y laisse une trace pour ne pas être recalculé. Il est stocké
+  en fp8 et **épinglé à 6 GiB** par nœud (560 000 tokens, soit deux
+  conversations de 262K) : on lui fixe une taille au lieu de laisser vLLM la
+  deviner, parce que cette estimation est peu fiable sur la mémoire unifiée
+  des Spark et finit en plantage.
+- **Prefix cache** : si une requête commence comme une précédente (cas typique
+  d'un agent, qui renvoie toute la conversation à chaque tour), le début est
+  repris du KV cache au lieu d'être recalculé.
+- **Image patchée** : le support de GLM-5.3 sur GB10 (sm_121) est récent. Le
+  vLLM officiel plante de plusieurs façons sur ce matériel ; l'image de
+  tonyd2wild corrige 7 bugs, et deux correctifs plus récents sont montés
+  par-dessus au démarrage (étape 5).
+- **Thinking** : le modèle peut « réfléchir » avant de répondre. C'est
+  désactivé par défaut ici (réponses et appels d'outils plus rapides) ; un
+  client peut le réactiver par requête.
+
+Budget mémoire d'un nœud (~121 GiB utilisables) :
+
+| Poste | Taille |
+|---|---|
+| moitié des poids du modèle | ~87 GiB |
+| drafter DFlash2 | ~1,3 GiB |
+| KV cache épinglé | 6 GiB |
+| activations, buffers, système, autres services | le reste, quelques GiB |
+
+Il ne reste que 1 à 2 GiB libres sous charge : **rien d'autre de lourd ne
+doit tourner sur les Spark** (ni Qwen, ni un autre modèle).
 
 Les deux machines utilisent **exactement le même dépôt et le même
 `docker-compose.yml`**. La seule différence entre elles est leur fichier
@@ -199,46 +250,58 @@ et le bootstrap NCCL sont en TCP.
 
 ---
 
-## 5. Mettre les poids du modèle sur les deux machines 🅰️🅱️
+## 5. Préparer les poids, l'image et les correctifs 🅰️🅱️
 
-Chaque nœud charge **sa moitié** du modèle depuis son disque local
-(`/home/mak/ai/models/GLM-5.3-Flash-NVFP4`, ~205 Go). Les poids doivent donc
-être présents **sur les deux machines**. Téléchargez-les une fois sur Spark A
-(révision figée dans le script) :
+Chaque nœud charge **sa moitié** du modèle depuis son disque local. Tout ce
+que le compose monte depuis l'hôte est préparé par un seul script, à
+révisions figées :
+
+| Quoi | Où | Taille |
+|---|---|---|
+| poids `nvidia/GLM-5.3-Flash-NVFP4` | `/home/mak/ai/models/GLM-5.3-Flash-NVFP4` | ~205 Go |
+| drafter `incoai/GLM-5.3-Flash-DFlash2` | `/home/mak/ai/models/GLM-5.3-Flash-DFlash2` | 2,2 Go |
+| image `ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2` | Docker local | |
+| correctif top-k SM121 et correctif prefix cache du drafter | `/home/mak/ai/glm53/patches` | |
+
+> **Pourquoi ces deux correctifs ?** L'image publiée date du 28/08. Sans le
+> premier, le moteur meurt dès qu'un contexte dépasse ~24K tokens. Sans le
+> second, le prefix cache ne sert à rien avec DFlash2 : chaque tour d'un agent
+> re-calcule toute la conversation (13K tokens : 21 s au lieu de 6 s).
+
+> **Temps de téléchargement** : ~220 Go au total (poids + image de 13 Gio
+> compressée). En Wi-Fi (~4 Mo/s mesurés), comptez **plus de 15 heures** ;
+> branchez le port RJ45 10 GbE (`enP7s7`) de Spark A pour tomber à moins
+> d'une heure si votre accès Internet suit. Spark B n'a rien à télécharger
+> d'Internet pour les poids : il les reçoit de A par le lien CX7.
+
+Sur Spark A, lancez le script complet :
 
 ```bash
 # 🅰️
 ./prepare-model.sh
 ```
 
-puis copiez-les vers Spark B par le lien CX7, bien plus rapide qu'un second
-téléchargement :
+Copiez ensuite les poids vers Spark B par le lien CX7, bien plus rapide qu'un
+second téléchargement :
 
 ```bash
 # 🅰️
-rsync -a --info=progress2 /home/mak/ai/models/GLM-5.3-Flash-NVFP4/ \
-  mak@192.168.100.11:/home/mak/ai/models/GLM-5.3-Flash-NVFP4/
+rsync -a --info=progress2 /home/mak/ai/models/GLM-5.3-Flash-NVFP4 \
+  /home/mak/ai/models/GLM-5.3-Flash-DFlash2 mak@192.168.100.11:/home/mak/ai/models/
 ```
 
-> **Le « mtpfix »** : le checkpoint NVIDIA stocke la tête MTP en BF16, ce qui
-> faisait échouer le chargement sur vLLM main
-> ([vllm#57532](https://github.com/vllm-project/vllm/issues/57532)). L'image
-> du compose contient déjà le correctif. Si le démarrage échoue malgré tout
-> sur `NVFP4 weight_scale for layer 'parallel_lm_head' was never loaded`,
-> lancez `./prepare-model.sh --mtpfix` **sur les deux nœuds**.
-
----
-
-## 6. Récupérer l'image 🅰️🅱️
-
-On utilise l'image vLLM nightly officielle, sans build local. Elle n'est pas
-figée par un tag de version mais par son commit, pour que les deux nœuds
-tournent exactement le même code :
+puis lancez le même script sur Spark B : il vérifie les poids copiés au lieu
+de les retélécharger, et prépare l'image et les correctifs.
 
 ```bash
-cd /home/mak/infra/vllm-config
-docker compose pull
+# 🅱️
+./prepare-model.sh
 ```
+
+> N'utilisez pas d'autres checkpoints NVFP4 (LibertAI, versions
+> « abliterated ») : ceux qui quantifient l'attention corrompent
+> silencieusement des tokens dans les appels d'outils
+> ([vllm#54150](https://github.com/vllm-project/vllm/issues/54150)).
 
 ---
 
@@ -303,7 +366,20 @@ Le modèle occupe presque toute la mémoire unifiée. **Avant chaque
 démarrage**, sur les deux machines :
 
 1. arrêtez tout autre modèle (`docker ps` : plus de `qwen38-vllm`, rien
-   d'autre de gros sur le GPU) ;
+   d'autre de gros sur le GPU). Pour basculer depuis Qwen3.8, arrêtez-le
+   **avant** de changer de branche, tant que le compose Qwen est encore en
+   place :
+
+   ```bash
+   # 🅰️🅱️
+   cd /home/mak/infra/vllm-config
+   docker compose down                      # arrête qwen38-vllm
+   git fetch && git checkout glm5.3-flash-dual-spark
+   ```
+
+   Retour arrière, même principe dans l'autre sens : `docker compose down`,
+   `git checkout qwen3.8-dual-spark`, `docker compose build`, cache vidé, puis
+   `docker compose up -d` sur les deux nœuds ;
 2. videz le page cache, que vLLM compte à tort comme occupé sur la mémoire
    unifiée :
 
@@ -312,12 +388,12 @@ démarrage**, sur les deux machines :
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 ```
 
-Lancez de préférence le head en premier, puis le worker dans la foulée :
+Lancez le **worker en premier**, puis le head environ 25 secondes après :
 
 ```bash
-# 🅰️
-docker compose up -d
 # 🅱️
+docker compose up -d
+# 🅰️ (~25 s plus tard)
 docker compose up -d
 ```
 
@@ -327,7 +403,7 @@ Suivez les logs **sur les deux machines** :
 docker compose logs -f
 ```
 
-Ce qui se passe pendant le démarrage, qui prend de 10 à 20 minutes :
+Ce qui se passe pendant le démarrage, qui prend environ 15 minutes :
 
 1. Le head ouvre le point de rendez-vous sur `192.168.100.10:29501` et
    **attend** le worker. Il est normal qu'il semble bloqué tant que B n'est
@@ -346,14 +422,18 @@ Ce qui se passe pendant le démarrage, qui prend de 10 à 20 minutes :
 curl -s http://localhost:8000/v1/models | jq
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.3-flash-nvfp4","messages":[{"role":"user","content":"Bonjour !"}]}' | jq
+  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Bonjour !"}]}' | jq
 ```
 
 Pendant une génération, `nvidia-smi` doit montrer les GPU **des deux
 machines** occupés.
 
-Les clients doivent utiliser le nom de modèle `glm-5.3-flash-nvfp4` :
+Les clients doivent utiliser le nom de modèle `glm-5.3-flash` :
 ceux configurés pour `Qwen/Qwen3.8-27B-FP8` recevront une erreur 404.
+
+Le thinking est **désactivé par défaut** : c'est plus rapide pour les appels
+d'outils. Un client le réactive par requête avec
+`"chat_template_kwargs": {"enable_thinking": true}`.
 
 Une fois que tout marche, repassez `NCCL_DEBUG=WARN` dans les deux `.env`
 pour alléger les logs.
@@ -366,7 +446,7 @@ pour alléger les logs.
 |---|---|
 | Arrêter | 🅰️🅱️ `docker compose down` |
 | Redémarrer | 🅰️🅱️ `docker compose restart` (sur **les deux**, voir ci-dessous) |
-| Mettre à jour la config | 🅰️🅱️ `git pull && docker compose pull && docker compose up -d` |
+| Mettre à jour la config | 🅰️🅱️ `git pull && ./prepare-model.sh && docker compose up -d` |
 | Logs | 🅰️🅱️ `docker compose logs -f` |
 
 > ⚠️ **Les deux nœuds forment un seul serveur.** Si l'un redémarre ou plante,
@@ -396,9 +476,11 @@ extra_hosts:
 | Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.10` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
 | `NET/Socket` au lieu de `NET/IB` dans les logs | NCCL ne trouve pas les cartes RDMA | `CX7_HCA` correspond au port câblé (`ibdev2netdev`) ; `/dev/infiniband` existe sur l'hôte |
 | Le ping jumbo de `check-cx7.sh` échoue | MTU différent des deux côtés | `ip link show <iface>` → `mtu 9000` sur A et B |
-| Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `docker compose pull` refait des deux côtés |
+| Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `./prepare-model.sh` relancé des deux côtés |
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
-| `NVFP4 weight_scale for layer 'parallel_lm_head' was never loaded` | tête MTP BF16 du checkpoint (vllm#57532) | `./prepare-model.sh --mtpfix` sur A et B |
+| Le moteur meurt sur une conversation de plus de ~24K tokens | correctif top-k absent | `ls /home/mak/ai/glm53/patches` sur A et B ; relancer `./prepare-model.sh` |
+| Chaque tour d'agent est lent (gros prefill à chaque fois) | correctif prefix cache absent | idem |
+| `NV_ERR_NO_MEMORY` sous charge | marge mémoire épuisée | passer `--kv-cache-memory` à `4294967296` (4 GiB, 372K tokens) sur A et B |
 | Out of memory au chargement ou au profiling | page cache plein ou autre process GPU | étape 8 : arrêter les autres modèles et vider le cache ; sinon baisser `--max-model-len` |
 | Moteur tué pendant un très long prefill | pic mémoire de l'indexeur sparse (vllm#55569) | garder `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
 | Appels d'outils jamais déclenchés | mauvais parser | `--tool-call-parser glm47` (pas `glm`) |
@@ -413,7 +495,7 @@ extra_hosts:
 |---|---|
 | `docker-compose.yml` | service vLLM, identique sur les deux nœuds |
 | `.env.example` | modèle de `.env` (rôle du nœud, IP, interfaces) |
-| `prepare-model.sh` | téléchargement des poids NVFP4, `--mtpfix` en secours |
+| `prepare-model.sh` | poids, drafter, image et correctifs, à révisions figées |
 | `netplan/40-cx7.yaml` | IP fixe du lien direct ConnectX-7 |
 | `check-cx7.sh` | vérification du lien et des poids avant démarrage |
 | `setup-thermal.sh`, `vllm-thermal.service` | limitation des fréquences GPU (GB10) |

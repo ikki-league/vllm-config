@@ -1,36 +1,40 @@
 #!/usr/bin/env bash
-# Prépare les poids GLM-5.3 Flash NVFP4 (NVIDIA) dans /home/mak/ai/models.
-# À lancer sur CHAQUE nœud (ou une fois sur le head puis rsync, voir README).
-# Usage: ./prepare-model.sh [--mtpfix]
-#
-# --mtpfix : exclut aussi le parallel_lm_head de la couche MTP de la
-# quantification NVFP4. Contournement de vllm#57532, inutile avec l'image du
-# compose (correctif vllm#55442 inclus) ; à n'appliquer que si le démarrage
-# échoue sur "NVFP4 weight_scale for layer 'parallel_lm_head' was never loaded".
+# Prépare tout ce que le compose monte depuis l'hôte, sur CE nœud :
+#   - poids nvidia/GLM-5.3-Flash-NVFP4 (~205 Go) et drafter DFlash2 (2,2 Go)
+#   - l'image patchée sm121
+#   - les deux correctifs vLLM montés par-dessus l'image (recette tonyd2wild)
+# Idempotent : relancer ne retélécharge que ce qui manque.
+# Usage: ./prepare-model.sh
 set -euo pipefail
 
-REPO=nvidia/GLM-5.3-Flash-NVFP4
-REVISION=da920bb0b9f4a06727223a349e55468e38352348
-DEST=/home/mak/ai/models/GLM-5.3-Flash-NVFP4
+MODELS=/home/mak/ai/models
+GLM=/home/mak/ai/glm53
+IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
 
-if [ "${1:-}" != "--mtpfix" ]; then
-  # ~205 Go ; reprend là où il s'est arrêté si interrompu
-  hf download "$REPO" --revision "$REVISION" --local-dir "$DEST"
-  echo "[OK] $REPO@${REVISION:0:7} dans $DEST ($(du -sh "$DEST" | cut -f1))"
-  exit 0
-fi
+# Révisions figées : les deux nœuds doivent servir exactement les mêmes fichiers
+WEIGHTS_REV=da920bb0b9f4a06727223a349e55468e38352348   # nvidia/GLM-5.3-Flash-NVFP4
+DRAFTER_REV=bf582e4eacc1810f76656d1811693ff6c6737d2a   # incoai/GLM-5.3-Flash-DFlash2
+RECIPE_REV=d061f26ad3ec5c3c04f64aad7516dbe62a8aa6af    # tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark
+RECIPE_RAW=https://raw.githubusercontent.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark/$RECIPE_REV
 
-python3 - "$DEST" <<'EOF'
-import json, sys, pathlib
-d = pathlib.Path(sys.argv[1])
-extra = ["parallel_lm_head", "*parallel_lm_head*"]
-for name, path in [("hf_quant_config.json", ("quantization", "exclude_modules")),
-                   ("config.json", ("quantization_config", "ignore"))]:
-    f = d / name
-    cfg = json.loads(f.read_text())
-    lst = cfg[path[0]][path[1]]
-    added = [e for e in extra if e not in lst]
-    lst.extend(added)
-    f.write_text(json.dumps(cfg, indent=2) + "\n")
-    print(f"[OK] {name}: {'ajouté ' + ', '.join(added) if added else 'déjà patché'}")
-EOF
+mkdir -p "$GLM/patches" "$GLM/cache/flashinfer" "$GLM/cache/tilelang" "$GLM/cache/triton"
+
+echo "=== Poids et drafter"
+hf download nvidia/GLM-5.3-Flash-NVFP4 --revision "$WEIGHTS_REV" --local-dir "$MODELS/GLM-5.3-Flash-NVFP4"
+# Licence CC-BY-NC-ND 4.0 : usage non commercial uniquement
+hf download incoai/GLM-5.3-Flash-DFlash2 --revision "$DRAFTER_REV" --local-dir "$MODELS/GLM-5.3-Flash-DFlash2"
+
+echo "=== Image"
+docker pull "$IMAGE"
+
+echo "=== Correctif top-k SM121 (sans lui, le moteur meurt au-delà de ~24K de contexte)"
+curl -fsSL "$RECIPE_RAW/docker/sparse_attn_indexer_kpool_sm121.py" -o "$GLM/patches/sparse_attn_indexer_kpool.py"
+
+echo "=== Correctif prefix cache du drafter (#18), appliqué dans un conteneur jetable"
+curl -fsSL "$RECIPE_RAW/docker/dflash2-overlay/patch_prefix_cache_draft_group.py" -o "$GLM/patches/patch_prefix_cache_draft_group.py"
+docker run --rm --entrypoint bash -v "$GLM/patches:/patches" "$IMAGE" -c '
+  set -e
+  python3 /patches/patch_prefix_cache_draft_group.py
+  cp /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py /patches/kv_cache_coordinator.py'
+
+echo "[OK] Tout est prêt dans $MODELS et $GLM"

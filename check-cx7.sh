@@ -26,3 +26,6 @@ fi
 ls -d /home/mak/ai/models/GLM-5.3-Flash-NVFP4/model.safetensors.index.json >/dev/null 2>&1 \
   && echo "[OK] Poids GLM-5.3-Flash-NVFP4 présents" \
   || echo "[KO] Poids GLM absents : lancer ./prepare-model.sh (README étape 5)"
+ls /home/mak/ai/glm53/patches/kv_cache_coordinator.py /home/mak/ai/glm53/patches/sparse_attn_indexer_kpool.py >/dev/null 2>&1 \
+  && echo "[OK] Correctifs vLLM présents" \
+  || echo "[KO] Correctifs absents : lancer ./prepare-model.sh"

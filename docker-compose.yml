@@ -2,27 +2,33 @@ name: ikki-spark
 
 # Déploiement dual DGX Spark (2x GB10) reliés en direct par ConnectX-7 (QSFP).
 # GLM-5.3 Flash (MoE 320B, 18B actifs), poids NVFP4 NVIDIA, découpé en tensor
-# parallel sur les deux nœuds (TP=2) via le backend multi-nœud natif de vLLM.
+# parallel sur les deux nœuds (TP=2) via le backend multi-nœud natif de vLLM,
+# décodage spéculatif DFlash2. Recette tonyd2wild CURRENT.md @d061f26
+# (github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark).
 #
 # Même fichier sur les deux machines ; le rôle de chaque nœud (rank, IP,
 # interfaces) vient du .env local, voir .env.example. Les poids doivent être
-# préparés sur chaque nœud avec ./prepare-model.sh. Puis sur chaque nœud :
-#   docker compose up -d     (head et worker dans n'importe quel ordre)
+# préparés sur chaque nœud avec ./prepare-model.sh. Puis, cache vidé :
+#   docker compose up -d     (worker d'abord, head ~25 s après)
 
 services:
   vllm:
-    # vLLM standard, nightly du 30/09/2026 (0.30.1rc1.dev396+gac68c3087, CUDA 13.0).
-    # glm5_next n'existe dans aucune release : ne pas passer sur un tag stable
-    # sans vérifier. Contient le correctif MTP NVFP4 (vllm#55442).
-    image: vllm/vllm-openai:nightly-ac68c3087215e0a4f3cdfa218508c6aada57235d
+    # Image vLLM patchée pour GB10/sm_121 (7 correctifs day-0) + DFlash2.
+    image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
     container_name: glm53-vllm
-    restart: unless-stopped
+    # Pas de redémarrage auto : un nœud qui repart seul ne peut pas rejoindre
+    # une session NCCL morte, il ne ferait que reboucler sur un OOM.
+    restart: "no"
+    # Plafond cgroup : un dépassement devient un OOM propre du conteneur au
+    # lieu de bloquer l'hôte (mémoire unifiée).
+    mem_limit: 112g
+    memswap_limit: 112g
 
     # NCCL/RoCE entre les nœuds : réseau hôte et accès direct aux devices RDMA.
     # L'API reste exposée sur le port 8000 de l'hôte head.
     network_mode: host
     ipc: host
-    shm_size: 16g
+    shm_size: 32g
     devices:
       - /dev/infiniband:/dev/infiniband
     cap_add:
@@ -34,7 +40,18 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - NVIDIA_FORWARD_COMPAT=1
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - VLLM_ENGINE_READY_TIMEOUT_S=3600
+      # Compilations JIT : limiter nvcc (sinon OOM au profiling) et garder les
+      # caches de kernels entre deux démarrages
+      - MAX_JOBS=2
+      - FLASHINFER_NVCC_THREADS=1
+      - TILELANG_CACHE_DIR=/cache/tilelang
+      - TRITON_CACHE_DIR=/cache/triton
+      - TORCH_CUDA_ARCH_LIST=12.1a
+      - FLASHINFER_CUDA_ARCH_LIST=12.1a
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
       # Évite l'épuisement de la mémoire unifiée sur les longs prefills (vllm#55569)
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - TOKENIZERS_PARALLELISM=false
@@ -48,10 +65,26 @@ services:
       # Les deux moitiés PCIe du même port QSFP, pour exploiter les 200 Gb/s
       - NCCL_IB_HCA=${CX7_HCA:-rocep1s0f1,roceP2p1s0f1}
       - NCCL_IB_DISABLE=0
+      - NCCL_NET=IB
+      - NCCL_IB_ROCE_VERSION_NUM=2
+      - NCCL_IB_ADDR_FAMILY=AF_INET
+      - NCCL_IB_ADDR_RANGE=192.168.100.0/24
+      - NCCL_NVLS_ENABLE=0
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_IGNORE_CPU_AFFINITY=1
+      - TORCH_NCCL_ASYNC_ERROR_HANDLING=1
       - NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
     volumes:
-      - /home/mak/ai/models:/models
+      - /home/mak/ai/models/GLM-5.3-Flash-NVFP4:/models/glm-5.3-flash-nvfp4:ro
+      - /home/mak/ai/models/GLM-5.3-Flash-DFlash2:/models/dflash2-draft:ro
+      - /home/mak/ai/glm53/cache:/cache
+      - /home/mak/ai/glm53/cache/flashinfer:/root/.cache/flashinfer
+      # Correctifs générés par prepare-model.sh, montés par-dessus l'image :
+      # top-k de l'indexeur sparse (crash au-delà de ~24K sinon) et prefix
+      # cache du drafter (sinon chaque tour d'agent re-prefill toute la conversation)
+      - /home/mak/ai/glm53/patches/sparse_attn_indexer_kpool.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
+      - /home/mak/ai/glm53/patches/kv_cache_coordinator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py:ro
       - vllm-logs:/var/log/vllm
 
     ulimits:
@@ -62,48 +95,54 @@ services:
         soft: 67108864
         hard: 67108864
 
-    # Notes de tuning (reprises de la config sudoingX, 2x Spark, 30/09/2026) :
-    # - ~95 GiB de poids par nœud sur 121 GiB de mémoire unifiée : marge très
-    #   faible, d'où max-num-seqs 1, enforce-eager (pas de mémoire de CUDA
-    #   graphs), petits batches de prefill, KV cache fp8 et autotune FlashInfer
-    #   coupé. Vider le page cache avant chaque démarrage (README).
-    # - glm47 pour les deux parsers : "glm" perd silencieusement les tool calls.
-    # - Le modèle fournit son propre chat template.
+    # Notes de tuning (CURRENT.md tonyd2wild, mesuré sur 2x Spark) :
+    # - ~87 GiB de poids par nœud : KV épinglé à 6 GiB (560K tokens, soit deux
+    #   requêtes de 262K). Avec l'épinglage vLLM ne profile plus la mémoire :
+    #   ne pas monter max-num-batched-tokens (16384 = NV_ERR_NO_MEMORY).
+    # - block-size 2304 obligatoire : pages de 64 entrées du MQA paginé fp8.
+    # - enforce-eager : les CUDA graphs n'apportent rien en TP=2 (mesuré).
+    # - DFlash2 k=7 : optimal sous 4 requêtes simultanées (k=5 au-delà).
+    # - Thinking désactivé par défaut ; un client le réactive par requête avec
+    #   "chat_template_kwargs": {"enable_thinking": true}.
+    # - glm47 pour les tool calls : "glm" les perd silencieusement.
     # Tous les arguments sauf VLLM_ROLE_ARGS doivent être identiques sur les
     # deux nœuds : c'est garanti tant que les deux machines sont sur le même
     # commit de ce dépôt.
     command: >
-      /models/GLM-5.3-Flash-NVFP4
-      --served-model-name glm-5.3-flash-nvfp4
+      /models/glm-5.3-flash-nvfp4
+      --served-model-name glm-5.3-flash
       --tensor-parallel-size 2
       --distributed-executor-backend mp
       --nnodes 2
       --node-rank ${NODE_RANK}
       --master-addr ${MASTER_ADDR:?MASTER_ADDR manquant dans .env}
       --master-port ${MASTER_PORT:-29501}
-      --max-model-len 131072
-      --max-num-batched-tokens 2048
-      --max-num-seqs 1
-      --gpu-memory-utilization 0.84
-      --kv-cache-dtype fp8
+      --max-model-len 262144
+      --max-num-seqs 6
+      --max-num-batched-tokens 8192
+      --gpu-memory-utilization 0.85
+      --kv-cache-dtype fp8_e4m3
+      --kv-cache-memory 6442450944
+      --block-size 2304
+      --moe-backend marlin
       --enforce-eager
-      --no-enable-flashinfer-autotune
       --language-model-only
-      --reasoning-parser glm47
+      --speculative-config '{"method": "dflash", "model": "/models/dflash2-draft", "num_speculative_tokens": 7}'
+      --reasoning-parser glm45
+      --default-chat-template-kwargs '{"enable_thinking": false}'
       --enable-auto-tool-choice
       --tool-call-parser glm47
-      --speculative-config '{"method": "mtp", "num_speculative_tokens": 5}'
       --trust-remote-code
       ${VLLM_ROLE_ARGS:?VLLM_ROLE_ARGS manquant dans .env}
 
     # Seul le head expose /health ; le worker headless est considéré sain
-    # tant que son process tourne. Chargement de ~100 Go par nœud : long.
+    # tant que son process tourne. ~15 min avant de servir (chargement des poids).
     healthcheck:
       test: ["CMD-SHELL", "[ \"$$NODE_RANK\" != 0 ] || curl -f http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 1200s
+      start_period: 1800s
 
     deploy:
       resources:
