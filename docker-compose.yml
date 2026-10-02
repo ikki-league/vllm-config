@@ -122,7 +122,7 @@ services:
       --max-num-batched-tokens 8192
       --gpu-memory-utilization 0.85
       --kv-cache-dtype fp8_e4m3
-      --kv-cache-memory 6442450944
+      --kv-cache-memory-bytes 6442450944
       --block-size 2304
       --moe-backend marlin
       --enforce-eager

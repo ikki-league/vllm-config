@@ -480,7 +480,7 @@ extra_hosts:
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
 | Le moteur meurt sur une conversation de plus de ~24K tokens | correctif top-k absent | `ls /home/mak/ai/glm53/patches` sur A et B ; relancer `./prepare-model.sh` |
 | Chaque tour d'agent est lent (gros prefill à chaque fois) | correctif prefix cache absent | idem |
-| `NV_ERR_NO_MEMORY` sous charge | marge mémoire épuisée | passer `--kv-cache-memory` à `4294967296` (4 GiB, 372K tokens) sur A et B |
+| `NV_ERR_NO_MEMORY` sous charge | marge mémoire épuisée | passer `--kv-cache-memory-bytes` à `4294967296` (4 GiB, 372K tokens) sur A et B |
 | Out of memory au chargement ou au profiling | page cache plein ou autre process GPU | étape 8 : arrêter les autres modèles et vider le cache ; sinon baisser `--max-model-len` |
 | Moteur tué pendant un très long prefill | pic mémoire de l'indexeur sparse (vllm#55569) | garder `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
 | Appels d'outils jamais déclenchés | mauvais parser | `--tool-call-parser glm47` (pas `glm`) |
