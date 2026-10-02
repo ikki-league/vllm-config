@@ -1,20 +1,21 @@
 name: ikki-spark
 
 # Déploiement dual DGX Spark (2x GB10) reliés en direct par ConnectX-7 (QSFP).
-# Le modèle est découpé en tensor parallel sur les deux nœuds (TP=2) via le
-# backend multi-nœud natif de vLLM (mp, sans Ray).
+# GLM-5.3 Flash (MoE 320B, 18B actifs), poids NVFP4 NVIDIA, découpé en tensor
+# parallel sur les deux nœuds (TP=2) via le backend multi-nœud natif de vLLM.
 #
 # Même fichier sur les deux machines ; le rôle de chaque nœud (rank, IP,
-# interfaces) vient du .env local, voir .env.example. Puis sur chaque nœud :
+# interfaces) vient du .env local, voir .env.example. Les poids doivent être
+# préparés sur chaque nœud avec ./prepare-model.sh. Puis sur chaque nœud :
 #   docker compose up -d     (head et worker dans n'importe quel ordre)
 
 services:
   vllm:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ikki-spark-vllm
-    container_name: qwen38-vllm
+    # vLLM standard, nightly du 30/09/2026 (0.30.1rc1.dev396+gac68c3087, CUDA 13.0).
+    # glm5_next n'existe dans aucune release : ne pas passer sur un tag stable
+    # sans vérifier. Contient le correctif MTP NVFP4 (vllm#55442).
+    image: vllm/vllm-openai:nightly-ac68c3087215e0a4f3cdfa218508c6aada57235d
+    container_name: glm53-vllm
     restart: unless-stopped
 
     # NCCL/RoCE entre les nœuds : réseau hôte et accès direct aux devices RDMA.
@@ -34,8 +35,7 @@ services:
       - NVIDIA_FORWARD_COMPAT=1
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - HF_HOME=/root/.cache/huggingface
-      - TORCH_CUDA_ARCH_LIST=12.1a
-      - TORCH_MATMUL_PRECISION=high
+      # Évite l'épuisement de la mémoire unifiée sur les longs prefills (vllm#55569)
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - TOKENIZERS_PARALLELISM=false
       # Multi-nœud : rôle et IP de ce nœud sur le lien CX7
@@ -51,7 +51,7 @@ services:
       - NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
     volumes:
-      - /home/mak/ai/models:/root/.cache/huggingface
+      - /home/mak/ai/models:/models
       - vllm-logs:/var/log/vllm
 
     ulimits:
@@ -62,54 +62,48 @@ services:
         soft: 67108864
         hard: 67108864
 
-    # Notes de tuning (vLLM 0.27.1, GB10 sm_121) :
-    # - le drafter MTP n'hérite pas de --attention-backend : sans
-    #   attention_backend dans --speculative-config il prend FlashInfer, ce qui
-    #   rétrograde tout le moteur en cudagraph PIECEWISE.
-    # - max-cudagraph-capture-size = max-num-seqs x (1 + num_speculative_tokens).
-    # - KV cache bf16 : le gain mémoire du fp8 est faible sur ce modèle hybride
-    #   (état GDN non quantifié) et la mémoire de deux nœuds suffit.
-    # - custom all-reduce inopérant entre deux nœuds, désactivé explicitement.
-    # - prefix caching + MTP sur hybride GDN : bugs connus en amont (sorties
-    #   "!!!!" ou vides, vllm#53912) ; à désactiver si ça apparaît.
+    # Notes de tuning (reprises de la config sudoingX, 2x Spark, 30/09/2026) :
+    # - ~95 GiB de poids par nœud sur 121 GiB de mémoire unifiée : marge très
+    #   faible, d'où max-num-seqs 1, enforce-eager (pas de mémoire de CUDA
+    #   graphs), petits batches de prefill, KV cache fp8 et autotune FlashInfer
+    #   coupé. Vider le page cache avant chaque démarrage (README).
+    # - glm47 pour les deux parsers : "glm" perd silencieusement les tool calls.
+    # - Le modèle fournit son propre chat template.
     # Tous les arguments sauf VLLM_ROLE_ARGS doivent être identiques sur les
     # deux nœuds : c'est garanti tant que les deux machines sont sur le même
     # commit de ce dépôt.
     command: >
-      Qwen/Qwen3.8-27B-FP8
+      /models/GLM-5.3-Flash-NVFP4
+      --served-model-name glm-5.3-flash-nvfp4
       --tensor-parallel-size 2
       --distributed-executor-backend mp
       --nnodes 2
       --node-rank ${NODE_RANK}
       --master-addr ${MASTER_ADDR:?MASTER_ADDR manquant dans .env}
       --master-port ${MASTER_PORT:-29501}
-      --max-model-len 262144
-      --max-num-batched-tokens 32768
-      --gpu-memory-utilization 0.85
-      --max-num-seqs 64
-      --kv-cache-dtype auto
-      --attention-backend triton_attn
-      --enable-chunked-prefill
-      --enable-prefix-caching
+      --max-model-len 131072
+      --max-num-batched-tokens 2048
+      --max-num-seqs 1
+      --gpu-memory-utilization 0.84
+      --kv-cache-dtype fp8
+      --enforce-eager
+      --no-enable-flashinfer-autotune
       --language-model-only
-      --reasoning-parser qwen3
+      --reasoning-parser glm47
       --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-      --chat-template /workspace/unsloth.jinja
-      --speculative-config '{"method": "mtp", "num_speculative_tokens": 3, "attention_backend": "TRITON_ATTN"}'
-      --max-cudagraph-capture-size 256
-      --disable-custom-all-reduce
+      --tool-call-parser glm47
+      --speculative-config '{"method": "mtp", "num_speculative_tokens": 5}'
       --trust-remote-code
       ${VLLM_ROLE_ARGS:?VLLM_ROLE_ARGS manquant dans .env}
 
     # Seul le head expose /health ; le worker headless est considéré sain
-    # tant que son process tourne.
+    # tant que son process tourne. Chargement de ~100 Go par nœud : long.
     healthcheck:
       test: ["CMD-SHELL", "[ \"$$NODE_RANK\" != 0 ] || curl -f http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 600s
+      start_period: 1200s
 
     deploy:
       resources:

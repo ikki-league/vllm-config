@@ -1,9 +1,16 @@
-# ikki-spark — Qwen3.8-27B-FP8 sur 2x DGX Spark
+# ikki-spark — GLM-5.3 Flash NVFP4 sur 2x DGX Spark
 
-Ce dépôt sert le modèle **Qwen3.8-27B-FP8** avec vLLM, réparti sur **deux DGX
+Cette branche sert **GLM-5.3 Flash** (MoE 320B, 18B actifs, poids NVFP4
+NVIDIA de ~205 Go) avec vLLM, réparti sur **deux DGX
 Spark** reliés en direct par un câble QSFP. Ce guide explique pas à pas
 comment passer de « deux machines indépendantes » à « un seul serveur
 d'inférence sur deux machines ».
+
+> Configuration reprise de [sudoingX](https://x.com/sudoingX/status/2105246609730924695)
+> (30/09/2026) : vLLM nightly standard, 15 tok/s sans MTP jusqu'à 128K de
+> contexte. Le modèle **ne tient pas sur une seule Spark** : TP=2 est
+> obligatoire. Pour revenir à Qwen3.8 : `git checkout qwen3.8-dual-spark`
+> sur les deux nœuds.
 
 ---
 
@@ -36,9 +43,10 @@ Quelques notions utiles :
 - **Head / worker** : vLLM lance un process par GPU. Le **head** (rank 0)
   coordonne et expose l'API ; le **worker** (rank 1) se contente de calculer.
   On n'envoie jamais de requête au worker.
-- **Ce qui est gagné** : la mémoire de deux GB10 au lieu d'une. On a donc
-  deux fois plus de place pour le KV cache, d'où `--max-num-seqs 64` au lieu
-  de 32.
+- **Ce qui est gagné** : la mémoire de deux GB10 au lieu d'une, soit
+  ~242 GiB. Les poids en prennent ~95 GiB par nœud : il reste très peu de
+  place, d'où une seule requête à la fois (`--max-num-seqs 1`), pas de CUDA
+  graphs (`--enforce-eager`) et un KV cache fp8.
 
 Les deux machines utilisent **exactement le même dépôt et le même
 `docker-compose.yml`**. La seule différence entre elles est leur fichier
@@ -66,7 +74,7 @@ Clonez-le à cet endroit **sur les deux machines** :
 mkdir -p /home/mak/infra
 git clone git@github.com:mak-ikki/vllm-config.git /home/mak/infra/vllm-config
 cd /home/mak/infra/vllm-config
-git checkout qwen3.8-dual-spark
+git checkout glm5.3-flash-dual-spark
 ```
 
 > **Pourquoi c'est important :** les arguments passés à vLLM (modèle,
@@ -166,7 +174,7 @@ Résultat attendu sur chaque machine :
 ```
 [OK] enp1s0f1np1 UP, MTU 9000
 [OK] 192.168.100.x joignable en MTU 9000
-[OK] Poids Qwen3.8-27B-FP8 présents
+[OK] Poids GLM-5.3-Flash-NVFP4 présents
 ```
 
 Si le port câblé n'est pas `enp1s0f1np1`, passez-le en 2e argument :
@@ -194,31 +202,43 @@ et le bootstrap NCCL sont en TCP.
 ## 5. Mettre les poids du modèle sur les deux machines 🅰️🅱️
 
 Chaque nœud charge **sa moitié** du modèle depuis son disque local
-(`/home/mak/ai/models`). Les poids doivent donc être présents **sur les deux
-machines**.
-
-Si Spark A les a déjà, le plus rapide est de les copier vers Spark B par le
-lien CX7 :
+(`/home/mak/ai/models/GLM-5.3-Flash-NVFP4`, ~205 Go). Les poids doivent donc
+être présents **sur les deux machines**. Téléchargez-les une fois sur Spark A
+(révision figée dans le script) :
 
 ```bash
-# 🅰️ depuis Spark A
-rsync -a --info=progress2 /home/mak/ai/models/ mak@192.168.100.11:/home/mak/ai/models/
+# 🅰️
+./prepare-model.sh
 ```
 
-Sinon, chaque machine les téléchargera elle-même au premier démarrage, ce qui
-est plus long (et nécessite `HUGGING_FACE_HUB_TOKEN` dans le `.env`).
+puis copiez-les vers Spark B par le lien CX7, bien plus rapide qu'un second
+téléchargement :
+
+```bash
+# 🅰️
+rsync -a --info=progress2 /home/mak/ai/models/GLM-5.3-Flash-NVFP4/ \
+  mak@192.168.100.11:/home/mak/ai/models/GLM-5.3-Flash-NVFP4/
+```
+
+> **Le « mtpfix »** : le checkpoint NVIDIA stocke la tête MTP en BF16, ce qui
+> faisait échouer le chargement sur vLLM main
+> ([vllm#57532](https://github.com/vllm-project/vllm/issues/57532)). L'image
+> du compose contient déjà le correctif. Si le démarrage échoue malgré tout
+> sur `NVFP4 weight_scale for layer 'parallel_lm_head' was never loaded`,
+> lancez `./prepare-model.sh --mtpfix` **sur les deux nœuds**.
 
 ---
 
-## 6. Construire l'image 🅰️🅱️
+## 6. Récupérer l'image 🅰️🅱️
+
+On utilise l'image vLLM nightly officielle, sans build local. Elle n'est pas
+figée par un tag de version mais par son commit, pour que les deux nœuds
+tournent exactement le même code :
 
 ```bash
 cd /home/mak/infra/vllm-config
-docker compose build
+docker compose pull
 ```
-
-L'image doit être construite **sur chaque machine** : elle est locale à chaque
-démon Docker.
 
 ---
 
@@ -279,6 +299,19 @@ doit montrer `--node-rank "0"` et `--host` sur A, et `--node-rank "1"` et
 
 ## 8. Démarrer
 
+Le modèle occupe presque toute la mémoire unifiée. **Avant chaque
+démarrage**, sur les deux machines :
+
+1. arrêtez tout autre modèle (`docker ps` : plus de `qwen38-vllm`, rien
+   d'autre de gros sur le GPU) ;
+2. videz le page cache, que vLLM compte à tort comme occupé sur la mémoire
+   unifiée :
+
+```bash
+# 🅰️🅱️
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+```
+
 Lancez de préférence le head en premier, puis le worker dans la foulée :
 
 ```bash
@@ -294,7 +327,7 @@ Suivez les logs **sur les deux machines** :
 docker compose logs -f
 ```
 
-Ce qui se passe pendant le démarrage, qui prend plusieurs minutes :
+Ce qui se passe pendant le démarrage, qui prend de 10 à 20 minutes :
 
 1. Le head ouvre le point de rendez-vous sur `192.168.100.10:29501` et
    **attend** le worker. Il est normal qu'il semble bloqué tant que B n'est
@@ -302,7 +335,7 @@ Ce qui se passe pendant le démarrage, qui prend plusieurs minutes :
 2. Le worker s'y connecte, et NCCL initialise le lien RDMA. Avec
    `NCCL_DEBUG=INFO`, on doit voir des lignes contenant **`NET/IB`** sur les
    deux machines. Si on voit `NET/Socket`, voir le dépannage ci-dessous.
-3. Chaque nœud charge sa moitié des poids, puis capture les CUDA graphs.
+3. Chaque nœud charge sa moitié des poids (~100 Go).
 4. Le head affiche `Application startup complete` et répond sur `:8000`.
 
 ---
@@ -313,11 +346,14 @@ Ce qui se passe pendant le démarrage, qui prend plusieurs minutes :
 curl -s http://localhost:8000/v1/models | jq
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"Bonjour !"}]}' | jq
+  -d '{"model":"glm-5.3-flash-nvfp4","messages":[{"role":"user","content":"Bonjour !"}]}' | jq
 ```
 
 Pendant une génération, `nvidia-smi` doit montrer les GPU **des deux
 machines** occupés.
+
+Les clients doivent utiliser le nom de modèle `glm-5.3-flash-nvfp4` :
+ceux configurés pour `Qwen/Qwen3.8-27B-FP8` recevront une erreur 404.
 
 Une fois que tout marche, repassez `NCCL_DEBUG=WARN` dans les deux `.env`
 pour alléger les logs.
@@ -330,7 +366,7 @@ pour alléger les logs.
 |---|---|
 | Arrêter | 🅰️🅱️ `docker compose down` |
 | Redémarrer | 🅰️🅱️ `docker compose restart` (sur **les deux**, voir ci-dessous) |
-| Mettre à jour la config | 🅰️🅱️ `git pull && docker compose build && docker compose up -d` |
+| Mettre à jour la config | 🅰️🅱️ `git pull && docker compose pull && docker compose up -d` |
 | Logs | 🅰️🅱️ `docker compose logs -f` |
 
 > ⚠️ **Les deux nœuds forment un seul serveur.** Si l'un redémarre ou plante,
@@ -360,9 +396,12 @@ extra_hosts:
 | Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.10` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
 | `NET/Socket` au lieu de `NET/IB` dans les logs | NCCL ne trouve pas les cartes RDMA | `CX7_HCA` correspond au port câblé (`ibdev2netdev`) ; `/dev/infiniband` existe sur l'hôte |
 | Le ping jumbo de `check-cx7.sh` échoue | MTU différent des deux côtés | `ip link show <iface>` → `mtu 9000` sur A et B |
-| Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `docker compose build` refait des deux côtés |
+| Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `docker compose pull` refait des deux côtés |
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
-| Réponses vides ou remplies de `!!!!` | bug amont prefix caching + MTP sur modèle hybride (vllm#53912) | retirer `--enable-prefix-caching` du compose sur A et B |
+| `NVFP4 weight_scale for layer 'parallel_lm_head' was never loaded` | tête MTP BF16 du checkpoint (vllm#57532) | `./prepare-model.sh --mtpfix` sur A et B |
+| Out of memory au chargement ou au profiling | page cache plein ou autre process GPU | étape 8 : arrêter les autres modèles et vider le cache ; sinon baisser `--max-model-len` |
+| Moteur tué pendant un très long prefill | pic mémoire de l'indexeur sparse (vllm#55569) | garder `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
+| Appels d'outils jamais déclenchés | mauvais parser | `--tool-call-parser glm47` (pas `glm`) |
 | Un nœud télécharge le modèle au démarrage | poids absents localement | étape 5 |
 | Coupure ou ralentissement sous charge | thermique | étape 3, `systemctl status vllm-thermal` sur **les deux** machines |
 
@@ -374,8 +413,7 @@ extra_hosts:
 |---|---|
 | `docker-compose.yml` | service vLLM, identique sur les deux nœuds |
 | `.env.example` | modèle de `.env` (rôle du nœud, IP, interfaces) |
-| `Dockerfile` | image vLLM + transformers récent + chat template |
-| `unsloth.jinja` | chat template Qwen3.8 (raisonnement `<think>` et appels d'outils) |
+| `prepare-model.sh` | téléchargement des poids NVFP4, `--mtpfix` en secours |
 | `netplan/40-cx7.yaml` | IP fixe du lien direct ConnectX-7 |
 | `check-cx7.sh` | vérification du lien et des poids avant démarrage |
 | `setup-thermal.sh`, `vllm-thermal.service` | limitation des fréquences GPU (GB10) |

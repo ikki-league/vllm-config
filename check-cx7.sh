@@ -23,6 +23,6 @@ if grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
 fi
 
 # Les poids doivent être présents localement sur chaque nœud
-ls -d /home/mak/ai/models/hub/models--Qwen--Qwen3.8-27B-FP8 >/dev/null 2>&1 \
-  && echo "[OK] Poids Qwen3.8-27B-FP8 présents" \
-  || echo "[WARN] Poids absents de /home/mak/ai/models : ils seront téléchargés au démarrage"
+ls -d /home/mak/ai/models/GLM-5.3-Flash-NVFP4/model.safetensors.index.json >/dev/null 2>&1 \
+  && echo "[OK] Poids GLM-5.3-Flash-NVFP4 présents" \
+  || echo "[KO] Poids GLM absents : lancer ./prepare-model.sh (README étape 5)"
