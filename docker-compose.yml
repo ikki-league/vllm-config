@@ -102,8 +102,10 @@ services:
     # - block-size 2304 obligatoire : pages de 64 entrées du MQA paginé fp8.
     # - enforce-eager : les CUDA graphs n'apportent rien en TP=2 (mesuré).
     # - DFlash2 k=7 : optimal sous 4 requêtes simultanées (k=5 au-delà).
-    # - Thinking désactivé par défaut ; un client le réactive par requête avec
-    #   "chat_template_kwargs": {"enable_thinking": true}.
+    # - Le chat template officiel ne permet pas de couper le thinking : il ne
+    #   connaît que reasoning_effort "low" ou "high", toute autre valeur (ou
+    #   rien) donne "max", le plus long. Défaut serveur "low" ; un client
+    #   monte par requête avec "chat_template_kwargs": {"reasoning_effort": "high"}.
     # - glm47 pour les tool calls : "glm" les perd silencieusement.
     # Tous les arguments sauf VLLM_ROLE_ARGS doivent être identiques sur les
     # deux nœuds : c'est garanti tant que les deux machines sont sur le même
@@ -129,7 +131,7 @@ services:
       --language-model-only
       --speculative-config '{"method": "dflash", "model": "/models/dflash2-draft", "num_speculative_tokens": 7}'
       --reasoning-parser glm45
-      --default-chat-template-kwargs '{"enable_thinking": false}'
+      --default-chat-template-kwargs '{"reasoning_effort": "low"}'
       --enable-auto-tool-choice
       --tool-call-parser glm47
       --trust-remote-code

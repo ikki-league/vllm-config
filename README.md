@@ -83,9 +83,9 @@ Quelques notions utiles :
   vLLM officiel plante de plusieurs façons sur ce matériel ; l'image de
   tonyd2wild corrige 7 bugs, et deux correctifs plus récents sont montés
   par-dessus au démarrage (étape 5).
-- **Thinking** : le modèle peut « réfléchir » avant de répondre. C'est
-  désactivé par défaut ici (réponses et appels d'outils plus rapides) ; un
-  client peut le réactiver par requête.
+- **Thinking** : le modèle « réfléchit » toujours avant de répondre, plus ou
+  moins longuement selon le niveau d'effort (`low`, `high`, `max`). Le
+  serveur règle `low` par défaut ; un client peut demander plus par requête.
 
 Budget mémoire d'un nœud (~121 GiB utilisables) :
 
@@ -431,9 +431,15 @@ machines** occupés.
 Les clients doivent utiliser le nom de modèle `glm-5.3-flash` :
 ceux configurés pour `Qwen/Qwen3.8-27B-FP8` recevront une erreur 404.
 
-Le thinking est **désactivé par défaut** : c'est plus rapide pour les appels
-d'outils. Un client le réactive par requête avec
-`"chat_template_kwargs": {"enable_thinking": true}`.
+Le modèle **réfléchit toujours** avant de répondre : son chat template n'a
+pas d'interrupteur, seulement un niveau d'effort, `low`, `high` ou `max`.
+Le serveur impose `low` par défaut (réponses et appels d'outils rapides) ; un
+client monte le niveau par requête avec
+`"chat_template_kwargs": {"reasoning_effort": "high"}`.
+
+> ⚠️ Toute autre valeur, par exemple `medium` envoyé par certains clients,
+> retombe sur **`max`**, le niveau le plus long : configurez les clients en
+> `low` ou `high`.
 
 Une fois que tout marche, repassez `NCCL_DEBUG=WARN` dans les deux `.env`
 pour alléger les logs.
