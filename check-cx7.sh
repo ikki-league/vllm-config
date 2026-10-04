@@ -23,9 +23,11 @@ if grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
 fi
 
 # Les poids doivent être présents localement sur chaque nœud
-ls -d /home/mak/ai/models/GLM-5.3-Flash-NVFP4/model.safetensors.index.json >/dev/null 2>&1 \
+AI_DIR="${AI_DIR:-$(sed -n 's/^AI_DIR=//p' "$(dirname "$0")/.env" 2>/dev/null)}"
+AI_DIR="${AI_DIR:-$HOME/ai}"
+ls -d $AI_DIR/models/GLM-5.3-Flash-NVFP4/model.safetensors.index.json >/dev/null 2>&1 \
   && echo "[OK] Poids GLM-5.3-Flash-NVFP4 présents" \
   || echo "[KO] Poids GLM absents : lancer ./prepare-model.sh (README étape 5)"
-ls /home/mak/ai/glm53/patches/kv_cache_coordinator.py /home/mak/ai/glm53/patches/sparse_attn_indexer_kpool.py >/dev/null 2>&1 \
+ls $AI_DIR/glm53/patches/kv_cache_coordinator.py $AI_DIR/glm53/patches/sparse_attn_indexer_kpool.py >/dev/null 2>&1 \
   && echo "[OK] Correctifs vLLM présents" \
   || echo "[KO] Correctifs absents : lancer ./prepare-model.sh"

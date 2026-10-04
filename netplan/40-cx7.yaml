@@ -1,6 +1,6 @@
 # Lien direct ConnectX-7 entre les deux DGX Spark.
 # À copier dans /etc/netplan/40-cx7.yaml sur chaque nœud en adaptant l'adresse
-# (head: 192.168.100.10, worker: 192.168.100.11), puis :
+# (head: 192.168.100.11, worker: 192.168.100.10), puis :
 #   sudo chmod 600 /etc/netplan/40-cx7.yaml && sudo netplan apply
 network:
   version: 2
@@ -11,4 +11,4 @@ network:
       link-local: []
       mtu: 9000
       addresses:
-        - 192.168.100.10/24
+        - 192.168.100.11/24

@@ -7,8 +7,12 @@
 # Usage: ./prepare-model.sh
 set -euo pipefail
 
-MODELS=/home/mak/ai/models
-GLM=/home/mak/ai/glm53
+# AI_DIR vient du .env du nœud (/home/ikki/ai sur le head, /home/mak/ai sur le worker)
+cd "$(dirname "$0")"
+AI_DIR="${AI_DIR:-$(sed -n 's/^AI_DIR=//p' .env 2>/dev/null)}"
+: "${AI_DIR:?AI_DIR absent du .env}"
+MODELS=$AI_DIR/models
+GLM=$AI_DIR/glm53
 IMAGE=ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
 
 # Révisions figées : les deux nœuds doivent servir exactement les mêmes fichiers

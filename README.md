@@ -24,8 +24,11 @@ d'inférence sur deux machines ».
                      ▼  http://<IP-LAN-de-Spark-A>:8000
    ┌────────────────────────────┐   câble QSFP 200 Gb/s   ┌────────────────────────────┐
    │ Spark A — HEAD (rank 0)    │◄───────────────────────►│ Spark B — WORKER (rank 1)  │
-   │ 192.168.100.10             │   RDMA (RoCE) / NCCL    │ 192.168.100.11             │
+   │ promaxgb10-e6a6, ikki      │   RDMA (RoCE) / NCCL    │ spark-8087, mak            │
+   │ 192.168.100.11             │                         │ 192.168.100.10             │
    │ • sert l'API sur :8000     │                         │ • pas d'API (--headless)   │
+   │                            │                         │ • relais :8000 → A pour    │
+   │                            │                         │   les clients locaux       │
    │ • moitié des poids du      │                         │ • autre moitié des poids   │
    │   modèle + KV cache        │                         │   du modèle + KV cache     │
    └────────────────────────────┘                         └────────────────────────────┘
@@ -107,9 +110,20 @@ Les deux machines utilisent **exactement le même dépôt et le même
 
 | | Spark A | Spark B |
 |---|---|---|
+| Machine | `promaxgb10-e6a6` | `spark-8087` |
+| Compte qui lance Docker | `ikki` | `mak` |
 | Rôle | head (rank 0) | worker (rank 1) |
-| IP sur le lien CX7 | `192.168.100.10` | `192.168.100.11` |
-| Expose l'API | oui, port 8000 | non |
+| IP sur le lien CX7 | `192.168.100.11` | `192.168.100.10` |
+| Dépôt | `/home/ikki/infra/vllm-config` | `/home/mak/infra/vllm-config` |
+| Données (`AI_DIR`) | `/home/ikki/ai` | `/home/mak/ai` |
+| Expose l'API | oui, port 8000 | relais : son `:8000` renvoie vers A |
+
+> **Pourquoi un relais sur B ?** Les clients (Hermes, nanoclaw, hybrid-llm,
+> devcontainers ikki via WireGuard `10.200.0.1`) tournent sur `spark-8087`
+> et appellent `:8000` en local. Plutôt que de les reconfigurer un par un —
+> et les pairs WireGuard ne voient de toute façon pas le lien CX7 —, un petit
+> conteneur `socat` (`glm53-relay`, activé par `COMPOSE_PROFILES=relay`)
+> écoute sur le `:8000` de B et transmet au head par le câble CX7.
 
 Chaque étape indique **où** exécuter les commandes :
 🅰️ = sur Spark A, 🅱️ = sur Spark B, 🅰️🅱️ = sur les deux.
@@ -118,15 +132,19 @@ Chaque étape indique **où** exécuter les commandes :
 
 ## 2. Préparer le dépôt 🅰️🅱️
 
-Le service thermique attend le dépôt dans `/home/mak/infra/vllm-config`.
-Clonez-le à cet endroit **sur les deux machines** :
+Clonez le dépôt dans le home du compte qui lance Docker sur chaque machine
+(`ikki` sur A, `mak` sur B) :
 
 ```bash
-mkdir -p /home/mak/infra
-git clone git@github.com:mak-ikki/vllm-config.git /home/mak/infra/vllm-config
-cd /home/mak/infra/vllm-config
+mkdir -p ~/infra
+git clone git@github.com:mak-ikki/vllm-config.git ~/infra/vllm-config
+cd ~/infra/vllm-config
 git checkout glm5.3-flash-dual-spark
 ```
+
+> Le service thermique (étape 3) pointe vers `/home/mak/infra/vllm-config` :
+> sur A, adaptez le chemin de `ExecStart` dans `vllm-thermal.service` si ce
+> clone-là n'existe pas.
 
 > **Pourquoi c'est important :** les arguments passés à vLLM (modèle,
 > parallélisme, taille du cache, décodage spéculatif…) doivent être
@@ -195,7 +213,7 @@ fixe dans un petit réseau privé dédié, `192.168.100.0/24`.
 
 ```bash
 sudo cp netplan/40-cx7.yaml /etc/netplan/40-cx7.yaml
-# laisser l'adresse 192.168.100.10/24
+# laisser l'adresse 192.168.100.11/24 (celle du head)
 # si le port câblé est enp1s0f0np0, remplacer le nom d'interface dans le fichier
 sudo chmod 600 /etc/netplan/40-cx7.yaml
 sudo netplan apply
@@ -205,7 +223,7 @@ sudo netplan apply
 
 ```bash
 sudo cp netplan/40-cx7.yaml /etc/netplan/40-cx7.yaml
-sudo sed -i 's#192.168.100.10/24#192.168.100.11/24#' /etc/netplan/40-cx7.yaml
+sudo sed -i 's#192.168.100.11/24#192.168.100.10/24#' /etc/netplan/40-cx7.yaml
 sudo chmod 600 /etc/netplan/40-cx7.yaml
 sudo netplan apply
 ```
@@ -217,8 +235,8 @@ sudo netplan apply
 
 ### 4.4 Tester le lien
 
-🅰️ `./check-cx7.sh 192.168.100.11`
-🅱️ `./check-cx7.sh 192.168.100.10`
+🅰️ `./check-cx7.sh 192.168.100.10`
+🅱️ `./check-cx7.sh 192.168.100.11`
 
 Résultat attendu sur chaque machine :
 
@@ -229,7 +247,7 @@ Résultat attendu sur chaque machine :
 ```
 
 Si le port câblé n'est pas `enp1s0f1np1`, passez-le en 2e argument :
-`./check-cx7.sh 192.168.100.11 enp1s0f0np0`.
+`./check-cx7.sh 192.168.100.10 enp1s0f0np0`.
 
 ### 4.5 Ouvrir le pare-feu sur le lien CX7 🅰️🅱️
 
@@ -258,10 +276,10 @@ révisions figées :
 
 | Quoi | Où | Taille |
 |---|---|---|
-| poids `nvidia/GLM-5.3-Flash-NVFP4` | `/home/mak/ai/models/GLM-5.3-Flash-NVFP4` | ~205 Go |
-| drafter `incoai/GLM-5.3-Flash-DFlash2` | `/home/mak/ai/models/GLM-5.3-Flash-DFlash2` | 2,2 Go |
+| poids `nvidia/GLM-5.3-Flash-NVFP4` | `$AI_DIR/models/GLM-5.3-Flash-NVFP4` | ~205 Go |
+| drafter `incoai/GLM-5.3-Flash-DFlash2` | `$AI_DIR/models/GLM-5.3-Flash-DFlash2` | 2,2 Go |
 | image `ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2` | Docker local | |
-| correctif top-k SM121 et correctif prefix cache du drafter | `/home/mak/ai/glm53/patches` | |
+| correctif top-k SM121 et correctif prefix cache du drafter | `$AI_DIR/glm53/patches` | |
 
 > **Pourquoi ces deux correctifs ?** L'image publiée date du 28/08. Sans le
 > premier, le moteur meurt dès qu'un contexte dépasse ~24K tokens. Sans le
@@ -286,8 +304,8 @@ second téléchargement :
 
 ```bash
 # 🅰️
-rsync -a --info=progress2 /home/mak/ai/models/GLM-5.3-Flash-NVFP4 \
-  /home/mak/ai/models/GLM-5.3-Flash-DFlash2 mak@192.168.100.11:/home/mak/ai/models/
+rsync -a --info=progress2 ~/ai/models/GLM-5.3-Flash-NVFP4 \
+  ~/ai/models/GLM-5.3-Flash-DFlash2 mak@192.168.100.10:/home/mak/ai/models/
 ```
 
 puis lancez le même script sur Spark B : il vérifie les poids copiés au lieu
@@ -317,23 +335,26 @@ cp .env.example .env
 
 ```ini
 NODE_RANK=0
-NODE_IP=192.168.100.10
+NODE_IP=192.168.100.11
 VLLM_ROLE_ARGS=--host 0.0.0.0 --port 8000
+AI_DIR=/home/ikki/ai
 ```
 
 🅱️ Sur Spark B, commentez le bloc head et décommentez le bloc worker :
 
 ```ini
 NODE_RANK=1
-NODE_IP=192.168.100.11
+NODE_IP=192.168.100.10
 VLLM_ROLE_ARGS=--headless
+AI_DIR=/home/mak/ai
+COMPOSE_PROFILES=relay               # lance aussi le relais :8000 -> A
 ```
 
 Sur **les deux**, vérifiez la partie commune :
 
 ```ini
 HUGGING_FACE_HUB_TOKEN=hf_...        # si les poids doivent être téléchargés
-MASTER_ADDR=192.168.100.10           # toujours l'IP de Spark A, même sur Spark B
+MASTER_ADDR=192.168.100.11           # toujours l'IP de Spark A, même sur Spark B
 MASTER_PORT=29501
 CX7_IFNAME=enp1s0f1np1               # relevé à l'étape 4.2
 CX7_HCA=rocep1s0f1,roceP2p1s0f1      # relevé à l'étape 4.2
@@ -347,6 +368,8 @@ Le rôle de chaque variable :
 | `NODE_RANK` | numéro du nœud : 0 = head, 1 = worker |
 | `NODE_IP` | IP **de cette machine** sur le lien CX7 ; vLLM l'annonce à l'autre nœud |
 | `VLLM_ROLE_ARGS` | head : ouvre l'API ; worker : `--headless`, pas d'API |
+| `AI_DIR` | dossier des poids, correctifs et caches de **cette machine** (home du compte qui lance Docker) |
+| `COMPOSE_PROFILES` | `relay` sur le worker seulement : ajoute le relais `:8000` vers le head |
 | `MASTER_ADDR` / `MASTER_PORT` | point de rendez-vous : le worker se connecte au head à cette adresse |
 | `CX7_IFNAME` | interface par laquelle NCCL fait le rendez-vous et les échanges TCP |
 | `CX7_HCA` | cartes RDMA que NCCL utilise pour les vrais transferts de données |
@@ -372,7 +395,7 @@ démarrage**, sur les deux machines :
 
    ```bash
    # 🅰️🅱️
-   cd /home/mak/infra/vllm-config
+   cd ~/infra/vllm-config
    docker compose down                      # arrête qwen38-vllm
    git fetch && git checkout glm5.3-flash-dual-spark
    ```
@@ -405,7 +428,7 @@ docker compose logs -f
 
 Ce qui se passe pendant le démarrage, qui prend environ 15 minutes :
 
-1. Le head ouvre le point de rendez-vous sur `192.168.100.10:29501` et
+1. Le head ouvre le point de rendez-vous sur `192.168.100.11:29501` et
    **attend** le worker. Il est normal qu'il semble bloqué tant que B n'est
    pas lancé.
 2. Le worker s'y connecte, et NCCL initialise le lien RDMA. Avec
@@ -463,10 +486,14 @@ pour alléger les logs.
 ### Accès depuis d'autres conteneurs
 
 Le conteneur utilise le réseau de l'hôte (`network_mode: host`), nécessaire
-pour RDMA. L'ancien réseau Docker `hermes-net` n'existe donc plus. Un client
-qui tourne lui-même dans un conteneur doit joindre l'API par l'IP de Spark A
-sur le LAN, ou par `host.docker.internal:8000` s'il tourne sur Spark A et
-déclare :
+pour RDMA. Un client joint l'API :
+
+- sur B, par `localhost:8000`, `172.17.0.1:8000` ou `10.200.0.1:8000`
+  (WireGuard) : c'est le relais qui répond et transmet à A ;
+- ailleurs, par `192.168.100.11:8000` (lien CX7) ou l'IP LAN de A.
+
+Un client qui tourne lui-même dans un conteneur sur B peut utiliser
+`host.docker.internal:8000` s'il déclare :
 
 ```yaml
 extra_hosts:
@@ -479,12 +506,12 @@ extra_hosts:
 
 | Symptôme | Cause probable | À vérifier |
 |---|---|---|
-| Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.10` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
+| Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.11` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
 | `NET/Socket` au lieu de `NET/IB` dans les logs | NCCL ne trouve pas les cartes RDMA | `CX7_HCA` correspond au port câblé (`ibdev2netdev`) ; `/dev/infiniband` existe sur l'hôte |
 | Le ping jumbo de `check-cx7.sh` échoue | MTU différent des deux côtés | `ip link show <iface>` → `mtu 9000` sur A et B |
 | Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `./prepare-model.sh` relancé des deux côtés |
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
-| Le moteur meurt sur une conversation de plus de ~24K tokens | correctif top-k absent | `ls /home/mak/ai/glm53/patches` sur A et B ; relancer `./prepare-model.sh` |
+| Le moteur meurt sur une conversation de plus de ~24K tokens | correctif top-k absent | `ls $AI_DIR/glm53/patches` sur A et B ; relancer `./prepare-model.sh` |
 | Chaque tour d'agent est lent (gros prefill à chaque fois) | correctif prefix cache absent | idem |
 | `NV_ERR_NO_MEMORY` sous charge | marge mémoire épuisée | passer `--kv-cache-memory-bytes` à `4294967296` (4 GiB, 372K tokens) sur A et B |
 | Out of memory au chargement ou au profiling | page cache plein ou autre process GPU | étape 8 : arrêter les autres modèles et vider le cache ; sinon baisser `--max-model-len` |

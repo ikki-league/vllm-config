@@ -76,15 +76,15 @@ services:
       - NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
     volumes:
-      - /home/mak/ai/models/GLM-5.3-Flash-NVFP4:/models/glm-5.3-flash-nvfp4:ro
-      - /home/mak/ai/models/GLM-5.3-Flash-DFlash2:/models/dflash2-draft:ro
-      - /home/mak/ai/glm53/cache:/cache
-      - /home/mak/ai/glm53/cache/flashinfer:/root/.cache/flashinfer
+      - ${AI_DIR:?AI_DIR manquant dans .env}/models/GLM-5.3-Flash-NVFP4:/models/glm-5.3-flash-nvfp4:ro
+      - ${AI_DIR:?AI_DIR manquant dans .env}/models/GLM-5.3-Flash-DFlash2:/models/dflash2-draft:ro
+      - ${AI_DIR:?AI_DIR manquant dans .env}/glm53/cache:/cache
+      - ${AI_DIR:?AI_DIR manquant dans .env}/glm53/cache/flashinfer:/root/.cache/flashinfer
       # Correctifs générés par prepare-model.sh, montés par-dessus l'image :
       # top-k de l'indexeur sparse (crash au-delà de ~24K sinon) et prefix
       # cache du drafter (sinon chaque tour d'agent re-prefill toute la conversation)
-      - /home/mak/ai/glm53/patches/sparse_attn_indexer_kpool.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
-      - /home/mak/ai/glm53/patches/kv_cache_coordinator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py:ro
+      - ${AI_DIR:?AI_DIR manquant dans .env}/glm53/patches/sparse_attn_indexer_kpool.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py:ro
+      - ${AI_DIR:?AI_DIR manquant dans .env}/glm53/patches/kv_cache_coordinator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_coordinator.py:ro
       - vllm-logs:/var/log/vllm
 
     ulimits:
@@ -159,6 +159,23 @@ services:
       options:
         max-size: "100m"
         max-file: "5"
+
+  # Relais de l'API, sur le worker seulement (COMPOSE_PROFILES=relay dans
+  # son .env) : les clients de cette machine (Hermes, nanoclaw, hybrid-llm,
+  # devcontainers via WireGuard) continuent d'appeler :8000 en local, le
+  # relais transmet au head par le lien CX7.
+  relay:
+    profiles: ["relay"]
+    image: alpine/socat:1.8.1.3
+    container_name: glm53-relay
+    restart: unless-stopped
+    network_mode: host
+    command: TCP-LISTEN:8000,fork,reuseaddr TCP:${MASTER_ADDR}:8000
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
 
 volumes:
   vllm-logs:
