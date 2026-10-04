@@ -483,6 +483,42 @@ pour alléger les logs.
 > **toujours redémarrer les deux**. De même, une modification de
 > `docker-compose.yml` doit être appliquée des deux côtés.
 
+### Redémarrage automatique : le watchdog 🅱️
+
+Les conteneurs n'ont pas de redémarrage automatique (`restart: "no"`) : un
+nœud qui repart seul ne peut pas rejoindre une session NCCL morte. C'est un
+**watchdog** sur B qui s'en charge, toutes les 2 minutes et au boot
+(timer systemd utilisateur de `mak`, actif au démarrage grâce au *linger*) :
+
+- serveur sain (`/health` du head ET conteneurs présents sur A et B) : rien ;
+- sinon, il relance **les deux** dans l'ordre de la recette — `down` des
+  deux, worker + relais, 25 s, head (piloté sur A en SSH par le compte
+  `ikki`) — puis laisse 25 min au démarrage avant de réévaluer ;
+- au-delà de 3 relances en 6 h, il abandonne et l'écrit au journal :
+  une panne qui persiste demande un humain.
+
+```bash
+# 🅱️ installation (une fois)
+mkdir -p ~/.config/systemd/user
+ln -sf ~/infra/vllm-config/systemd/glm53-watchdog.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now glm53-watchdog.timer
+
+journalctl --user -u glm53-watchdog -f                  # suivre ses décisions
+touch ~/.local/state/glm53-watchdog/pause               # maintenance manuelle
+rm ~/.local/state/glm53-watchdog/pause                  # reprise
+```
+
+> ⚠️ Avant toute intervention manuelle (`docker compose down`, changement de
+> branche…), **mettez le watchdog en pause** : sinon il relancera le serveur
+> dans les 2 minutes.
+
+### Versions des drivers NVIDIA
+
+Les deux nœuds doivent avoir **la même version du driver** : en TP=2, des
+versions CUDA/NCCL différentes peuvent provoquer des erreurs qui
+n'apparaissent qu'en charge. Vérification : `nvidia-smi --query-gpu=driver_version
+--format=csv,noheader` sur A et B.
+
 ### Accès depuis d'autres conteneurs
 
 Le conteneur utilise le réseau de l'hôte (`network_mode: host`), nécessaire

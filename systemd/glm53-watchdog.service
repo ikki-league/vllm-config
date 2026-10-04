@@ -1,0 +1,7 @@
+[Unit]
+Description=Watchdog GLM dual Spark (relance worker + head si besoin)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/infra/vllm-config/glm53-watchdog.sh
