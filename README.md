@@ -137,7 +137,7 @@ Clonez le dépôt dans le home du compte qui lance Docker sur chaque machine
 
 ```bash
 mkdir -p ~/infra
-git clone git@github.com:mak-ikki/vllm-config.git ~/infra/vllm-config
+git clone git@github.com:ikki-league/vllm-config.git ~/infra/vllm-config
 cd ~/infra/vllm-config
 git checkout glm5.3-flash-dual-spark
 ```
