@@ -544,6 +544,7 @@ extra_hosts:
 |---|---|---|
 | Le head reste bloqué au démarrage | le worker n'est pas lancé ou ne joint pas le head | `docker compose ps` sur B ; `MASTER_ADDR` identique des deux côtés ; `ping 192.168.100.11` depuis B ; pare-feu ouvert sur le lien CX7 (étape 4.5) ; erreur `1/2 clients joined` après 10 min |
 | `NET/Socket` au lieu de `NET/IB` dans les logs | NCCL ne trouve pas les cartes RDMA | `CX7_HCA` correspond au port câblé (`ibdev2netdev`) ; `/dev/infiniband` existe sur l'hôte |
+| `NCCL WARN NET/IB : roceP2p1s0f1:1 GID table changed` en boucle | la 2e moitié du port (`enP2p1s0f1np1`) n'est pas dans netplan : NetworkManager y tente un DHCP toutes les 45 s, et elle reste en MTU 1500 | le bloc `enP2p1s0f1np1` de `netplan/40-cx7.yaml` présent dans `/etc/netplan/40-cx7.yaml` sur A et B ; `cat /sys/class/net/enP2p1s0f1np1/mtu` → 9000 |
 | Le ping jumbo de `check-cx7.sh` échoue | MTU différent des deux côtés | `ip link show <iface>` → `mtu 9000` sur A et B |
 | Erreur de forme ou de config au chargement | les deux nœuds n'ont pas les mêmes arguments | `git log --oneline -1` identique sur A et B ; `./prepare-model.sh` relancé des deux côtés |
 | Timeout NCCL après un redémarrage d'un seul nœud | l'autre nœud tient une session NCCL morte | redémarrer **les deux** : `docker compose restart` sur A et B |
