@@ -12,11 +12,3 @@ network:
       mtu: 9000
       addresses:
         - 192.168.100.11/24
-    # Deuxième moitié PCIe du même port QSFP (HCA roceP2p1s0f1, utilisée par
-    # NCCL via CX7_HCA). Pas d'IP, mais il faut la déclarer : sinon
-    # NetworkManager y tente un DHCP qui échoue toutes les 45 s, ce qui change
-    # sa table GID (NCCL WARN "GID table changed"), et elle reste en MTU 1500.
-    enP2p1s0f1np1:
-      dhcp4: false
-      dhcp6: false
-      mtu: 9000
